@@ -38,8 +38,11 @@ RUN pip install --no-cache-dir \
     "peft>=0.18.0" \
     huggingface_hub
 
-# RunPod SDK
-RUN pip install --no-cache-dir runpod
+# RunPod SDK + FastAPI
+RUN pip install --no-cache-dir runpod fastapi uvicorn
+
+# Training deps
+RUN pip install --no-cache-dir lightning tensorboard bitsandbytes
 
 # Flash attention (optional, speeds up inference)
 RUN pip install --no-cache-dir flash-attn --no-build-isolation 2>/dev/null || echo "flash-attn build skipped"
@@ -49,7 +52,10 @@ ARG HF_TOKEN
 COPY download_weights.py /app/download_weights.py
 RUN HF_TOKEN=${HF_TOKEN} python /app/download_weights.py
 
-# Copy handler
+# Copy application files
 COPY handler.py /app/handler.py
+COPY api.py /app/api.py
 
-CMD ["python", "/app/handler.py"]
+# Default: FastAPI server. Override with CMD ["python", "/app/handler.py"] for RunPod.
+EXPOSE 8000
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000", "--app-dir", "/app"]

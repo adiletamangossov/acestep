@@ -4,41 +4,44 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-RunPod Serverless deployment for ACE-Step 1.5 XL music generation model. A Go backend sends requests; this service generates music and returns MP3 audio as base64.
+ACE-Step 1.5 XL music generation model — inference and LoRA training. Deployed on a supercomputer via Docker. Also supports RunPod Serverless mode.
 
 ## Architecture
 
-- **handler.py** — RunPod Serverless entry point. Loads DiT (XL turbo 4B) + LLM (4B) at worker startup, handles generation requests. Patches `vector_quantize_pytorch` for meta-tensor compatibility before model loading.
-- **download_weights.py** — Runs during Docker build to download model weights from HuggingFace (main model, 4B LLM, XL turbo DiT).
-- **Dockerfile** — CUDA 12.4 + Python 3.11 + PyTorch 2.6.0 image with ACE-Step 1.5 cloned from GitHub and weights baked in.
+- **api.py** — FastAPI server with endpoints for inference (`/generate`), LoRA training (`/train`), LoRA management (`/lora/*`), and health check (`/health`). Default entry point.
+- **handler.py** — RunPod Serverless handler (alternative entry point).
+- **download_weights.py** — Downloads model weights from HuggingFace during Docker build.
+- **Dockerfile** — CUDA 12.4 + Python 3.11 + PyTorch 2.6.0 image. Default CMD runs FastAPI on port 8000. Override with `CMD ["python", "/app/handler.py"]` for RunPod.
 
 ## Build & Deploy
 
 ```bash
-# Build (on Linux x86_64, needs ~50GB disk)
-export HF_TOKEN=your_token
+# Build (Linux x86_64, needs ~50GB disk)
 docker build --build-arg HF_TOKEN=$HF_TOKEN -t innlabkz/acestep-runpod:latest .
 
-# Push
-docker push innlabkz/acestep-runpod:latest
+# Run FastAPI (default)
+docker run --gpus all -p 8000:8000 innlabkz/acestep-runpod:latest
+
+# Run RunPod handler
+docker run --gpus all innlabkz/acestep-runpod:latest python /app/handler.py
 ```
 
-RunPod Serverless config: GPU 24GB+ (RTX 4090 / A40), Container disk 50GB, Execution timeout 300s.
+## API Endpoints
 
-## API Contract
-
-Go backend expects this exact response shape:
-
-```json
-{"status": "ok", "audio_base64": "...", "mime_type": "audio/mp3", "seed": 123, "actual_bpm": 120, "actual_key": "C major"}
-```
-
-Error response: `{"status": "error", "message": "...", "trace": "..."}`.
+- `POST /generate` — music generation, returns `{status, audio_base64, mime_type, seed, actual_bpm, actual_key}`
+- `POST /train` — start LoRA training in background (dataset_dir, output_dir, epochs, lr, lora_rank...)
+- `GET /train/status` — check training progress
+- `POST /lora/load` — load LoRA adapter (lora_path, adapter_name, scale)
+- `POST /lora/unload` — unload all LoRA adapters
+- `GET /lora/status` — current LoRA adapter state
+- `GET /health` — health check
 
 ## Key Implementation Details
 
-- Models: `acestep-v15-xl-turbo` (DiT) + `acestep-5Hz-lm-4B` (LLM). Weights stored at `/weights/checkpoints/`.
+- Models: `acestep-v15-xl-turbo` (4B DiT) + `acestep-5Hz-lm-4B` (LLM). Weights at `/weights/checkpoints/`.
 - BPM/key metadata comes from `result.extra_outputs["lm_metadata"]`, NOT from `result.audios[i]`.
 - WAV generated first, then converted to MP3 via ffmpeg (`libmp3lame -qscale:a 2`).
 - Two patches required for `vector_quantize_pytorch`: assertion removal in `residual_fsq.py` and meta-device fallback in `finite_scalar_quantization.py`.
-- ACE-Step is installed from git clone at `/app/ACE-Step-1.5` inside the container.
+- LoRA training uses ACE-Step's built-in `train.py fixed` (Side-Step V2). Preprocessing converts audio to tensors first, then trains.
+- LoRA loading via `dit_handler.add_lora()` / `dit_handler.unload_lora()`. Not compatible with quantized models.
+- ACE-Step cloned at `/app/ACE-Step-1.5` inside the container.
