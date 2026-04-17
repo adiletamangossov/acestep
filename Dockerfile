@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -14,16 +14,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Upgrade pip
 RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# PyTorch 2.6.0 + cu124
+# PyTorch 2.10.0 + cu128 (pinned by ACE-Step 1.5)
 RUN pip install --no-cache-dir \
-    torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
-    --index-url https://download.pytorch.org/whl/cu124
+    torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
+    --index-url https://download.pytorch.org/whl/cu128
 
 # ACE-Step 1.5
 RUN git clone --depth 1 https://github.com/ace-step/ACE-Step-1.5.git /app/ACE-Step-1.5
 WORKDIR /app/ACE-Step-1.5
 
-# Install ACE-Step deps (skip their torch pin, we already have ours)
+# Install ACE-Step deps
 RUN pip install --no-cache-dir -e . || true
 RUN pip install --no-cache-dir \
     "transformers>=4.51.0" \

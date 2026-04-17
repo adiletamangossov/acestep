@@ -1,13 +1,14 @@
 """FastAPI server for ACE-Step 1.5 XL inference and LoRA training."""
 
 import base64
+import json
 import os
 import random
 import subprocess
 import tempfile
 import pathlib
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
@@ -16,8 +17,20 @@ from pydantic import BaseModel, Field
 # Patch vector_quantize_pytorch before any model import
 # ---------------------------------------------------------------------------
 
+def _find_vq_dir():
+    """Find vector_quantize_pytorch in either site-packages or dist-packages."""
+    for variant in ["dist-packages", "site-packages"]:
+        p = pathlib.Path(f"/usr/local/lib/python3.11/{variant}/vector_quantize_pytorch")
+        if p.exists():
+            return p
+    return None
+
+
 def patch_vector_quantize():
-    site = pathlib.Path("/usr/local/lib/python3.11/site-packages/vector_quantize_pytorch")
+    site = _find_vq_dir()
+    if site is None:
+        print("WARNING: vector_quantize_pytorch not found, skipping patch", flush=True)
+        return
 
     f1 = site / "residual_fsq.py"
     if f1.exists():
@@ -40,6 +53,8 @@ def patch_vector_quantize():
     for pyc in site.rglob("*.pyc"):
         pyc.unlink(missing_ok=True)
 
+    print(f"Patched vector_quantize_pytorch at {site}", flush=True)
+
 
 # ---------------------------------------------------------------------------
 # Global model handles
@@ -48,6 +63,9 @@ def patch_vector_quantize():
 dit_handler = None
 llm_handler = None
 _training_status = {"running": False, "message": "idle"}
+
+CHECKPOINTS_DIR = "/weights/checkpoints"
+ACE_STEP_DIR = "/app/ACE-Step-1.5"
 
 
 def load_models():
@@ -67,7 +85,7 @@ def load_models():
 
     llm_handler = LLMHandler()
     msg, ok = llm_handler.initialize(
-        checkpoint_dir="/weights/checkpoints",
+        checkpoint_dir=CHECKPOINTS_DIR,
         lm_model_path="acestep-5Hz-lm-4B",
         backend="pt",
         device="cuda",
@@ -109,21 +127,27 @@ class GenerateResponse(BaseModel):
 
 
 class TrainRequest(BaseModel):
-    dataset_dir: str = Field(description="Path to dataset directory with audio + lyrics/metadata files")
+    dataset_dir: str = Field(description="Path to dir with audio files + .lyrics.txt / .json metadata")
     output_dir: str = Field(default="/weights/lora_output", description="Where to save trained LoRA adapter")
-    epochs: int = Field(default=100, ge=1, le=1000)
+    exp_name: str = Field(default="lora_train", description="Experiment name for logging")
+    max_steps: int = Field(default=2000, ge=100, le=10000000)
     learning_rate: float = Field(default=1e-4, gt=0)
-    batch_size: int = Field(default=1, ge=1, le=8)
-    gradient_accumulation_steps: int = Field(default=4, ge=1)
-    lora_rank: int = Field(default=8, ge=1, le=128)
-    lora_alpha: int = Field(default=16, ge=1, le=256)
-    save_every_n_epochs: int = Field(default=10, ge=1)
-    gradient_checkpointing: bool = True
+    accumulate_grad_batches: int = Field(default=1, ge=1)
+    save_every_n_steps: int = Field(default=2000, ge=100)
+    lora_rank: int = Field(default=256, ge=1, le=512)
+    lora_alpha: int = Field(default=32, ge=1, le=512)
+    target_modules: List[str] = Field(
+        default=["speaker_embedder", "linear_q", "linear_k", "linear_v",
+                 "to_q", "to_k", "to_v", "to_out.0"],
+        description="LoRA target modules"
+    )
+    repeat_count: int = Field(default=2000, ge=1, description="Dataset repeat count for convert2hf_dataset")
+    gradient_clip_val: float = Field(default=0.5, ge=0)
 
 
 class LoraLoadRequest(BaseModel):
     lora_path: str = Field(description="Path to LoRA adapter directory")
-    adapter_name: str = Field(default="default", description="Name for the adapter")
+    adapter_name: Optional[str] = Field(default=None, description="Name for the adapter (auto-generated if None)")
     scale: float = Field(default=1.0, ge=0.0, le=2.0)
 
 
@@ -195,43 +219,52 @@ def generate(req: GenerateRequest):
 
 def _run_training(req: TrainRequest):
     global _training_status
-    _training_status = {"running": True, "message": "preprocessing dataset..."}
+    _training_status = {"running": True, "message": "converting dataset to HF format..."}
 
     try:
-        checkpoint_dir = "/weights/checkpoints"
         os.makedirs(req.output_dir, exist_ok=True)
+        dataset_name = os.path.join(req.output_dir, f"{req.exp_name}_dataset")
 
-        # Step 1: Preprocess audio to tensors
-        preprocessed_dir = os.path.join(req.output_dir, "preprocessed")
-        os.makedirs(preprocessed_dir, exist_ok=True)
-
-        _training_status["message"] = "preprocessing audio to tensors..."
+        # Step 1: Convert raw audio + metadata to HuggingFace dataset
+        _training_status["message"] = "converting dataset to HF format..."
         subprocess.run([
-            "python", "train.py", "fixed",
-            "--preprocess",
-            "--audio-dir", req.dataset_dir,
-            "--tensor-output", preprocessed_dir,
-            "--checkpoint-dir", checkpoint_dir,
-            "--model-variant", "xl_turbo",
-        ], check=True, cwd="/app/ACE-Step-1.5")
+            "python", "convert2hf_dataset.py",
+            "--data_dir", req.dataset_dir,
+            "--repeat_count", str(req.repeat_count),
+            "--output_name", dataset_name,
+        ], check=True, cwd=ACE_STEP_DIR)
 
-        # Step 2: Train LoRA
-        _training_status["message"] = f"training LoRA (0/{req.epochs} epochs)..."
+        # Step 2: Generate LoRA config
+        lora_config = {
+            "r": req.lora_rank,
+            "lora_alpha": req.lora_alpha,
+            "target_modules": req.target_modules,
+            "use_rslora": True,
+        }
+        lora_config_path = os.path.join(req.output_dir, "lora_config.json")
+        with open(lora_config_path, "w") as f:
+            json.dump(lora_config, f, indent=2)
+
+        # Step 3: Train LoRA via trainer.py
+        _training_status["message"] = f"training LoRA (max_steps={req.max_steps})..."
         subprocess.run([
-            "python", "train.py", "fixed",
-            "--tensor-dir", preprocessed_dir,
-            "--checkpoint-dir", checkpoint_dir,
-            "--model-variant", "xl_turbo",
-            "--output-dir", req.output_dir,
-            "--epochs", str(req.epochs),
-            "--lr", str(req.learning_rate),
-            "--batch-size", str(req.batch_size),
-            "--grad-accum", str(req.gradient_accumulation_steps),
-            "--lora-rank", str(req.lora_rank),
-            "--lora-alpha", str(req.lora_alpha),
-            "--save-every", str(req.save_every_n_epochs),
-        ] + (["--gradient-checkpointing"] if req.gradient_checkpointing else []),
-            check=True, cwd="/app/ACE-Step-1.5")
+            "python", "trainer.py",
+            "--dataset_path", dataset_name,
+            "--exp_name", req.exp_name,
+            "--checkpoint_dir", CHECKPOINTS_DIR,
+            "--learning_rate", str(req.learning_rate),
+            "--max_steps", str(req.max_steps),
+            "--every_n_train_steps", str(req.save_every_n_steps),
+            "--accumulate_grad_batches", str(req.accumulate_grad_batches),
+            "--gradient_clip_val", str(req.gradient_clip_val),
+            "--gradient_clip_algorithm", "norm",
+            "--lora_config_path", lora_config_path,
+            "--logger_dir", os.path.join(req.output_dir, "logs"),
+            "--shift", "3.0",
+            "--precision", "bf16-mixed",
+            "--devices", "1",
+            "--epochs", "-1",
+        ], check=True, cwd=ACE_STEP_DIR)
 
         _training_status = {"running": False, "message": f"done. adapter saved to {req.output_dir}"}
 
@@ -270,9 +303,11 @@ def load_lora(req: LoraLoadRequest):
     if not os.path.isdir(req.lora_path):
         raise HTTPException(400, f"LoRA path not found: {req.lora_path}")
 
-    dit_handler.add_lora(req.lora_path, adapter_name=req.adapter_name)
-    dit_handler.set_lora_scale(req.adapter_name, req.scale)
-    return {"status": "ok", "message": f"LoRA '{req.adapter_name}' loaded from {req.lora_path}"}
+    msg = dit_handler.add_lora(req.lora_path, adapter_name=req.adapter_name)
+    if req.scale != 1.0:
+        adapter = req.adapter_name or "default"
+        dit_handler.set_lora_scale(adapter, req.scale)
+    return {"status": "ok", "message": msg}
 
 
 @app.post("/lora/unload")
@@ -280,8 +315,8 @@ def unload_lora():
     if dit_handler is None:
         raise HTTPException(503, "Models not loaded yet")
 
-    dit_handler.unload_lora()
-    return {"status": "ok", "message": "All LoRA adapters unloaded"}
+    msg = dit_handler.unload_lora()
+    return {"status": "ok", "message": msg}
 
 
 @app.get("/lora/status")

@@ -11,7 +11,7 @@ ACE-Step 1.5 XL music generation model — inference and LoRA training. Deployed
 - **api.py** — FastAPI server with endpoints for inference (`/generate`), LoRA training (`/train`), LoRA management (`/lora/*`), and health check (`/health`). Default entry point.
 - **handler.py** — RunPod Serverless handler (alternative entry point).
 - **download_weights.py** — Downloads model weights from HuggingFace during Docker build.
-- **Dockerfile** — CUDA 12.4 + Python 3.11 + PyTorch 2.6.0 image. Default CMD runs FastAPI on port 8000. Override with `CMD ["python", "/app/handler.py"]` for RunPod.
+- **Dockerfile** — CUDA 12.8 + Python 3.11 + PyTorch 2.10.0 image. Default CMD runs FastAPI on port 8000. Override with `CMD ["python", "/app/handler.py"]` for RunPod.
 
 ## Build & Deploy
 
@@ -41,7 +41,7 @@ docker run --gpus all innlabkz/acestep-runpod:latest python /app/handler.py
 - Models: `acestep-v15-xl-turbo` (4B DiT) + `acestep-5Hz-lm-4B` (LLM). Weights at `/weights/checkpoints/`.
 - BPM/key metadata comes from `result.extra_outputs["lm_metadata"]`, NOT from `result.audios[i]`.
 - WAV generated first, then converted to MP3 via ffmpeg (`libmp3lame -qscale:a 2`).
-- Two patches required for `vector_quantize_pytorch`: assertion removal in `residual_fsq.py` and meta-device fallback in `finite_scalar_quantization.py`.
-- LoRA training uses ACE-Step's built-in `train.py fixed` (Side-Step V2). Preprocessing converts audio to tensors first, then trains.
+- Two patches required for `vector_quantize_pytorch`: assertion removal in `residual_fsq.py` and meta-device fallback in `finite_scalar_quantization.py`. Patch auto-detects `dist-packages` vs `site-packages`.
+- LoRA training: `convert2hf_dataset.py` converts raw audio to HF dataset, then `trainer.py` trains with LoRA config JSON. Uses PyTorch Lightning.
 - LoRA loading via `dit_handler.add_lora()` / `dit_handler.unload_lora()`. Not compatible with quantized models.
 - ACE-Step cloned at `/app/ACE-Step-1.5` inside the container.

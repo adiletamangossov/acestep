@@ -7,9 +7,21 @@ import os
 import pathlib
 
 
+def _find_vq_dir():
+    """Find vector_quantize_pytorch in either site-packages or dist-packages."""
+    for variant in ["dist-packages", "site-packages"]:
+        p = pathlib.Path(f"/usr/local/lib/python3.11/{variant}/vector_quantize_pytorch")
+        if p.exists():
+            return p
+    return None
+
+
 def patch_vector_quantize():
     """Patch vector_quantize_pytorch for meta-tensor compatibility."""
-    site = pathlib.Path("/usr/local/lib/python3.11/site-packages/vector_quantize_pytorch")
+    site = _find_vq_dir()
+    if site is None:
+        print("WARNING: vector_quantize_pytorch not found, skipping patch", flush=True)
+        return
 
     f1 = site / "residual_fsq.py"
     if f1.exists():
